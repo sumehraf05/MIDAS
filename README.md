@@ -72,12 +72,6 @@ which xds_par
 xds_par | head -4
 ```
 
-### Optional: CCP4 + SHELX (for structure solution)
-
-CCP4 is required to run `structure_solution.py`. Download from
-https://www.ccp4.ac.uk. This provides `pointless`, `mtz2various`,
-`shelxt`, and `shelxl`.
-
 ---
 
 ## Quick Start
@@ -91,9 +85,6 @@ python train_cnn.py
 
 # Step 3: Re-run with CNN quality scores feeding into dataset selection
 python xds_pipeline.py --folder /path/to/your/data
-
-# Step 4: Run structure solution (requires CCP4)
-python structure_solution.py
 ```
 
 See `TUTORIAL.md` for a complete step-by-step walkthrough with the
@@ -165,14 +156,6 @@ parent_folder/
         optimal/
             XSCALE.HKL                 # Best subset merged (use this)
         trials/                        # One folder per greedy search step
-    structure_solution/                # Created by structure_solution.py
-        1_pointless/
-            pointless.mtz              # Space group determination output
-        2_shelxt/
-            molecule.res               # Initial atomic model
-        3_shelxl/
-            refined.res                # Final refined structure
-            refined.lst                # Refinement statistics
 ```
 
 **The file to use for structure determination is `xscale/optimal/XSCALE.HKL`.**
