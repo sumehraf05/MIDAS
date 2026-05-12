@@ -21,9 +21,8 @@ it straightforward to verify that the pipeline is working correctly.
 4. [Step 2: Running XDS processing](#4-step-2-running-xds-processing)
 5. [Step 3: Understanding the quality report](#5-step-3-understanding-the-quality-report)
 6. [Step 4: Training the CNN](#6-step-4-training-the-cnn)
-7. [Expected results for acetaminophen](#8-expected-results-for-acetaminophen)
-8. [Interpreting statistics](#9-interpreting-statistics)
-9. [Adapting to your own data](#10-adapting-to-your-own-data)
+7. [Interpreting statistics](#9-interpreting-statistics)
+8. [Adapting to your own data](#10-adapting-to-your-own-data)
 
 ---
 
@@ -320,7 +319,7 @@ feed into the XSCALE subset selection.
 
 ---
 
-## 9. Interpreting Statistics
+## 7. Interpreting Statistics
 
 ### Indexed fraction (Idx%)
 
@@ -377,7 +376,7 @@ The signal-to-noise ratio averaged over all reflections.
 
 ---
 
-## 10. Adapting to Your Own Data
+## 8. Adapting to Your Own Data
 
 ### Different molecule
 
