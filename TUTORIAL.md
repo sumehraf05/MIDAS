@@ -21,10 +21,9 @@ it straightforward to verify that the pipeline is working correctly.
 4. [Step 2: Running XDS processing](#4-step-2-running-xds-processing)
 5. [Step 3: Understanding the quality report](#5-step-3-understanding-the-quality-report)
 6. [Step 4: Training the CNN](#6-step-4-training-the-cnn)
-7. [Step 5: Structure solution](#7-step-5-structure-solution)
-8. [Expected results for acetaminophen](#8-expected-results-for-acetaminophen)
-9. [Interpreting statistics](#9-interpreting-statistics)
-10. [Adapting to your own data](#10-adapting-to-your-own-data)
+7. [Expected results for acetaminophen](#8-expected-results-for-acetaminophen)
+8. [Interpreting statistics](#9-interpreting-statistics)
+9. [Adapting to your own data](#10-adapting-to-your-own-data)
 
 ---
 
@@ -318,114 +317,6 @@ python xds_pipeline.py --folder /path/to/my_experiment
 
 On this second run, the CNN will add quality scores to every dataset that
 feed into the XSCALE subset selection.
-
----
-
-## 7. Step 5: Structure Solution
-
-With the merged XSCALE.HKL in hand, run structure solution:
-
-```bash
-python structure_solution.py
-```
-
-```
-Drag the PARENT folder:
-> /path/to/my_experiment
-
-Molecular formula (default: C8 H9 N1 O2)
-Press Enter for default:
->
-```
-
-The script runs:
-
-1. **POINTLESS** — determines the true space group by analysing systematic
-   absences. For acetaminophen this typically finds space group P-1 (triclinic,
-   space group #2).
-
-2. **SHELXT** — structure solution by dual-space direct methods. Reads the
-   merged reflection data and finds the positions of all atoms in the unit
-   cell without any prior structural knowledge.
-
-3. **SHELXL** — least-squares refinement. Takes the SHELXT solution and
-   iteratively adjusts atomic positions and displacement parameters to best
-   fit the observed diffraction data.
-
-Expected output for acetaminophen:
-```
-  FINAL RESULTS
-  Space group  : P -1  (#2)
-  Unit cell    : 9.39 9.44 15.23 90.25 90.07 119.81
-  SHELXT  R1   : 0.21  (20 atoms placed)
-  SHELXL  R1   : 0.18   wR2 : 0.41
-  Quality: OK  (R1 < 0.20, further refinement may help)
-```
-
-The R1 factor measures the agreement between observed and calculated
-diffraction intensities. For microED data at this stage:
-- R1 < 0.15 is excellent
-- R1 < 0.25 is good for a starting point
-- R1 > 0.30 suggests the solution may need refinement or the space group
-  may need to be reconsidered
-
-**Note for publication:** The SHELXL refinement in this script uses X-ray
-scattering factors as a starting point. For publication-quality microED
-structures, electron scattering factors must be used. Consult your advisor
-about the `ABIN` keyword in SHELXL for electron diffraction refinement.
-
----
-
-## 8. Expected Results for Acetaminophen
-
-### Unit cell
-
-Acetaminophen (Form I) has a triclinic unit cell:
-
-| Parameter | Expected | Typical range from microED |
-|-----------|----------|---------------------------|
-| a | 9.40 Å | 9.3–9.5 Å |
-| b | 9.44 Å | 9.3–9.5 Å |
-| c | 15.23 Å | 15.0–15.5 Å |
-| α | 90.0° | 89–91° |
-| β | 90.0° | 89–91° |
-| γ | 119.8° | 119–121° |
-| Space group | P-1 (#2) | |
-
-### Merged data quality targets
-
-| Statistic | Acceptable | Good |
-|-----------|-----------|------|
-| Completeness | > 60% | > 75% |
-| Rmeas | < 0.35 | < 0.20 |
-| CC½ | > 0.80 | > 0.90 |
-| I/sigma | > 1.0 | > 2.0 |
-
-### Structure solution targets
-
-| Statistic | Acceptable | Good |
-|-----------|-----------|------|
-| SHELXT R1 | < 0.30 | < 0.20 |
-| SHELXL R1 | < 0.25 | < 0.15 |
-| SHELXL wR2 | < 0.60 | < 0.40 |
-
-### Acetaminophen atomic structure
-
-Acetaminophen (paracetamol) has the molecular formula C₈H₉NO₂ with a
-molecular weight of 151.16 Da. The structure consists of a para-substituted
-benzene ring with a hydroxyl group (–OH) and an acetamide group (–NHCOCH₃).
-
-The known reference structure is deposited in the Cambridge Structural
-Database as entry **HXACAN**. After a successful pipeline run and structure
-solution, the refined coordinates should match this reference with an RMSD
-of less than 0.05 Å for non-hydrogen atoms.
-
-To verify your result against the reference:
-1. Open the refined `.res` file from `structure_solution/3_shelxl/` in
-   Mercury (part of CCP4) or ORTEP
-2. Compare visually with HXACAN from the Cambridge Structural Database
-3. The two structures should be chemically identical — benzene ring, hydroxyl
-   group, and acetamide group all in the correct connectivity
 
 ---
 
