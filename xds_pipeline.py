@@ -4,6 +4,7 @@
 xds_pipeline.py
 ===============
 Automated batch processing pipeline for MicroED crystallographic datasets.
+
     1. Renumber image files starting at 1 (rerun-safe, backs up originals)
     2. Auto-generate or patch XDS.INP with per-dataset parameters from the
        image header (distance, wavelength, beam centre, data range, etc.)
@@ -22,7 +23,7 @@ Automated batch processing pipeline for MicroED crystallographic datasets.
        completeness while minimising Rmerge / CC½ degradation
 
 Usage:
-  python3 xds_pipeline.py
+  python xds_pipeline.py
 
 You will be prompted to drag-and-drop the parent folder containing all dataset
 subdirectories. XDS (xds_par) and XSCALE (xscale_par) must be on your PATH.
@@ -401,6 +402,172 @@ def tail_log(log_path: Path, n: int = 25) -> str:
     except OSError:
         return "    (could not read log file)"
 
+
+
+def adaptive_spot_size(root_path: Path, subdir_name: str,
+                        n_images: int, log_dir: Path) -> int:
+    """
+    Find the best MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT value by trying
+    multiple values and picking the one that gives the best indexing.
+
+    For microED on a CETA detector, spots are typically 3-6 pixels wide.
+    - Too small (2-3): picks up noise along with real spots
+    - Too large (8+): misses weak high-resolution spots
+
+    We try [3, 4, 6] and return the value giving the best indexed fraction.
+    The best value is also patched into XDS.INP so subsequent steps use it.
+
+    Returns the best MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT value found.
+    """
+    candidates = [3, 4, 6]
+    best_val   = 6       # conservative default
+    best_frac  = 0.0
+
+    log.info("  Adaptive spot size: testing MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT = %s",
+             candidates)
+
+    for val in candidates:
+        # Patch the value into XDS.INP
+        xds_inp = root_path / "XDS.INP"
+        if not xds_inp.exists():
+            break
+        lines = xds_inp.read_text(errors="replace").splitlines()
+        out = []
+        found = False
+        for line in lines:
+            if line.strip().startswith("MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT="):
+                out.append(f"MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT= {val}")
+                found = True
+            else:
+                out.append(line)
+        if not found:
+            out.append(f"MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT= {val}")
+        xds_inp.write_text("\n".join(out) + "\n")
+
+        # Run just COLSPOT + IDXREF to test
+        log_test = log_dir / f"{subdir_name}_spottest_px{val}.log"
+        rc = run_xds(root_path, "XYCORR INIT COLSPOT IDXREF", log_test)
+
+        idx   = parse_idxref(root_path)
+        frac  = idx["indexed_fraction"] or 0.0
+        n_idx = idx["indexed_spots"]    or 0
+
+        log.info("    PIXELS=%d -> %d/%s indexed (%.1f%%)",
+                 val, n_idx, idx["total_spots"], frac * 100)
+
+        if frac > best_frac:
+            best_frac = frac
+            best_val  = val
+
+    log.info("  Best MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT = %d  (%.1f%% indexed)",
+             best_val, best_frac * 100)
+
+    # Patch the winning value permanently
+    xds_inp = root_path / "XDS.INP"
+    if xds_inp.exists():
+        lines = xds_inp.read_text(errors="replace").splitlines()
+        out = []
+        for line in lines:
+            if line.strip().startswith("MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT="):
+                out.append(f"MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT= {best_val}")
+            else:
+                out.append(line)
+        xds_inp.write_text("\n".join(out) + "\n")
+
+    return best_val
+
+
+def reindex_with_reference_cell(root_path: Path, subdir_name: str,
+                                  ref_cell: dict, log_dir: Path) -> dict:
+    """
+    Re-run IDXREF with the consensus cell as a reference to correct
+    datasets that indexed to a slightly wrong alternative lattice.
+
+    When multiple indexing solutions are possible (e.g. different
+    orientations of the same lattice), XDS may pick the wrong one.
+    Providing the known correct cell as a starting point forces XDS
+    to find the solution closest to the reference.
+
+    This is the key to getting consistent indexing across all datasets:
+    every dataset ends up describing the same lattice in the same setting.
+
+    ref_cell: dict with keys a,b,c,alpha,beta,gamma (floats)
+    Returns updated parse_idxref() result.
+    """
+    xds_inp = root_path / "XDS.INP"
+    if not xds_inp.exists():
+        return parse_idxref(root_path)
+
+    a   = ref_cell.get("a",     0)
+    b   = ref_cell.get("b",     0)
+    c   = ref_cell.get("c",     0)
+    alp = ref_cell.get("alpha", 90)
+    bet = ref_cell.get("beta",  90)
+    gam = ref_cell.get("gamma", 90)
+
+    log.info("  Re-indexing with reference cell: %.2f %.2f %.2f  %.2f %.2f %.2f",
+             a, b, c, alp, bet, gam)
+
+    # Patch UNIT_CELL_CONSTANTS and SPACE_GROUP_NUMBER into XDS.INP
+    lines = xds_inp.read_text(errors="replace").splitlines()
+    out = []
+    seen_cell = seen_sg = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("UNIT_CELL_CONSTANTS="):
+            out.append(f"UNIT_CELL_CONSTANTS= {a:.3f} {b:.3f} {c:.3f} "
+                       f"{alp:.3f} {bet:.3f} {gam:.3f}")
+            seen_cell = True
+        elif stripped.startswith("SPACE_GROUP_NUMBER="):
+            out.append("SPACE_GROUP_NUMBER= 1")
+            seen_sg = True
+        else:
+            out.append(line)
+    if not seen_cell:
+        out.append(f"UNIT_CELL_CONSTANTS= {a:.3f} {b:.3f} {c:.3f} "
+                   f"{alp:.3f} {bet:.3f} {gam:.3f}")
+    if not seen_sg:
+        out.append("SPACE_GROUP_NUMBER= 1")
+    xds_inp.write_text("\n".join(out) + "\n")
+
+    # Re-run IDXREF only (no need for COLSPOT again -- spots are already found)
+    log_reindex = log_dir / f"{subdir_name}_XDS_reindex.log"
+    t0  = time.time()
+    rc  = run_xds(root_path, "IDXREF", log_reindex)
+    idx = parse_idxref(root_path)
+    frac  = idx["indexed_fraction"] or 0.0
+    n_idx = idx["indexed_spots"]    or 0
+    log.info("  Re-index result: %d/%s indexed (%.1f%%)  cell=%s  (%.1f s)",
+             n_idx, idx["total_spots"], frac * 100,
+             idx["unit_cell"], time.time() - t0)
+    return idx
+
+
+def compute_consensus_cell(csv_rows: list) -> dict:
+    """
+    Compute the consensus unit cell from all successfully processed datasets.
+
+    Uses the median of each cell parameter across datasets that have valid
+    cells and produced HKL files. Returns a dict with keys a,b,c,alpha,beta,gamma.
+    """
+    import statistics
+
+    params = {"a": [], "b": [], "c": [], "alpha": [], "beta": [], "gamma": []}
+    for row in csv_rows:
+        if str(row.get("has_hkl", "NO")).upper() != "YES":
+            continue
+        try:
+            for p in params:
+                v = float(row.get(p) or "n/a")
+                params[p].append(v)
+        except (ValueError, TypeError):
+            pass
+
+    if not params["a"]:
+        return {}
+
+    return {p: round(statistics.median(vals), 3)
+            for p, vals in params.items() if vals}
 
 def check_xds_available() -> bool:
     """Check xds_par is on PATH. Logs a clear error if not. Call at startup."""
@@ -828,8 +995,18 @@ def parse_xscale_lp(run_dir: Path) -> dict:
     """
     Parse XSCALE.LP for merged-dataset quality statistics.
 
-    Returns overall and highest-resolution shell values for:
-    completeness, Rmerge, Rmeas, I/sigma, CC½, n_unique.
+    XSCALE.LP contains multiple "total" lines:
+      1. The main statistics table total  -- has 13+ tokens including n_obs,
+         n_uniq, completeness%, Rsym%, Rmeas%, I/sig, CC1/2 etc.
+      2. Per-dataset R-factor totals       -- short lines with only 3-4 tokens
+
+    We specifically look for the main statistics total line (>= 10 tokens).
+
+    XSCALE.LP column layout (new XDS format with % signs):
+      total  n_obs  n_uniq  n_poss  comp%  rsym%  rmeas%  ?  isigi  ranom%  cc_half*  ...
+
+    Values with * (e.g. 96.6*) mean the CC1/2 is statistically significant.
+    Values of -99.9 mean the statistic could not be calculated.
     """
     result = {
         "completeness_overall": None,
@@ -838,7 +1015,6 @@ def parse_xscale_lp(run_dir: Path) -> dict:
         "isigi_overall":        None,
         "cc_half_overall":      None,
         "n_unique_overall":     None,
-
         "completeness_hi":      None,
         "rmerge_hi":            None,
         "rmeas_hi":             None,
@@ -853,77 +1029,87 @@ def parse_xscale_lp(run_dir: Path) -> dict:
 
     text = lp.read_text(errors="replace")
 
-    # Shell rows
-    row_pat = re.compile(
-        r"^\s*([\d.]+)\s+"      # d_limit
-        r"(\d+)\s+"             # n_obs
-        r"(\d+)\s+"             # n_uniq
-        r"[\d.]+\s+"            # mult
-        r"([\d.]+)\s+"          # comp
-        r"([\d.]+)\s+"          # isigi
-        r"([\d.]+)\s+"          # Rsym/Rmerge
-        r"([\d.]+)\s+"          # Rmeas
-        r"[\d.]+\s+"            # Ranom
-        r"([\d.*]+)",           # CC(1/2)
-        re.MULTILINE,
-    )
+    def clean_val(s):
+        """Strip %, * and whitespace. Return float or None if -99.9/invalid."""
+        if s is None:
+            return None
+        s = str(s).strip().rstrip("%").rstrip("*").strip()
+        try:
+            v = float(s)
+            return None if v <= -99.0 else v
+        except (ValueError, TypeError):
+            return None
 
+    # ---------------------------------------------------------------
+    # Find the MAIN statistics total line.
+    # It has >= 10 tokens and the 4th token (index 4) is completeness%.
+    # Short "total" lines from per-dataset R-factor tables have only 3-4 tokens.
+    # ---------------------------------------------------------------
+    main_total_tokens = None
+    for line in text.splitlines():
+        if not re.match(r"^\s*total\s+\d", line, re.IGNORECASE):
+            continue
+        tokens = [t.rstrip("%").rstrip("*") for t in line.split()]
+        if len(tokens) >= 10:
+            # Verify this looks like the main statistics line:
+            # token[4] should be completeness (0-100)
+            v = clean_val(tokens[4]) if len(tokens) > 4 else None
+            if v is not None and 0 <= v <= 100:
+                main_total_tokens = tokens
+                # Don't break -- take the LAST matching total line
+    
+    if main_total_tokens:
+        t = main_total_tokens
+        # Column mapping confirmed from XSCALE.LP inspection:
+        # [0]=total [1]=n_obs [2]=n_uniq [3]=n_poss [4]=comp%
+        # [5]=rsym% [6]=rmeas% [7]=? [8]=isigi [9]=ranom% [10]=cc_half*
+        try:
+            result["n_unique_overall"]     = int(t[2]) if len(t) > 2 else None
+            result["completeness_overall"] = clean_val(t[4]) if len(t) > 4 else None
+            result["rmerge_overall"]       = (clean_val(t[5]) / 100.0
+                                              if len(t) > 5 and clean_val(t[5]) else None)
+            result["rmeas_overall"]        = (clean_val(t[6]) / 100.0
+                                              if len(t) > 6 and clean_val(t[6]) else None)
+            result["isigi_overall"]        = clean_val(t[8])  if len(t) > 8  else None
+            # CC1/2: token[10] is e.g. "96.6*" -- already stripped above
+            cc_val = clean_val(t[10]) if len(t) > 10 else None
+            if cc_val is not None:
+                result["cc_half_overall"] = cc_val / 100.0 if cc_val > 1.0 else cc_val
+        except (IndexError, ValueError, TypeError):
+            pass
+
+    # ---------------------------------------------------------------
+    # Shell rows for highest-resolution statistics
+    # Lines that start with a numeric d-spacing (resolution in Angstroms)
+    # ---------------------------------------------------------------
     shells = []
-    for m in row_pat.finditer(text):
-        d         = safe_float(m.group(1))
-        comp      = safe_float(m.group(4))
-        isigi     = safe_float(m.group(5))
-        rmerge_p  = safe_float(m.group(6))
-        rmeas_p   = safe_float(m.group(7))
-        cc_str    = m.group(8).replace("*", "")
-        cc_half   = safe_float(cc_str)
-        if d is not None:
-            shells.append({
-                "d":       d,
-                "comp":    comp,
-                "isigi":   isigi,
-                "rmerge":  rmerge_p / 100.0 if rmerge_p is not None else None,
-                "rmeas":   rmeas_p  / 100.0 if rmeas_p  is not None else None,
-                "cc_half": cc_half  / 100.0 if cc_half  is not None else None,
-            })
+    for line in text.splitlines():
+        m = re.match(r"^\s*([\d.]+)\s+\d+\s+\d+\s+\d+\s+", line)
+        if m:
+            d = safe_float(m.group(1))
+            if d and 0.5 <= d <= 50.0:
+                tokens = [t.rstrip("%").rstrip("*") for t in line.split()]
+                shells.append((d, tokens))
 
     if shells:
-        hi = min(shells, key=lambda r: r["d"])
-        result["completeness_hi"] = hi["comp"]
-        result["rmerge_hi"]       = hi["rmerge"]
-        result["rmeas_hi"]        = hi["rmeas"]
-        result["isigi_hi"]        = hi["isigi"]
-        result["cc_half_hi"]      = hi["cc_half"]
-        result["resolution_high"] = hi["d"]
-
-    # Total row
-    total_pat = re.compile(
-        r"^\s*total\s+"
-        r"(\d+)\s+"             # n_obs
-        r"(\d+)\s+"             # n_uniq
-        r"[\d.]+\s+"            # mult
-        r"([\d.]+)\s+"          # comp
-        r"([\d.]+)\s+"          # isigi
-        r"([\d.]+)\s+"          # Rmerge
-        r"([\d.]+)\s+"          # Rmeas
-        r"[\d.]+\s+"
-        r"([\d.*]+)",           # CC(1/2)
-        re.MULTILINE | re.IGNORECASE,
-    )
-    m = total_pat.search(text)
-    if m:
-        result["n_unique_overall"]     = int(m.group(2))
-        result["completeness_overall"] = safe_float(m.group(3))
-        result["isigi_overall"]        = safe_float(m.group(4))
-        rmerge_p = safe_float(m.group(5))
-        rmeas_p  = safe_float(m.group(6))
-        result["rmerge_overall"] = rmerge_p / 100.0 if rmerge_p is not None else None
-        result["rmeas_overall"]  = rmeas_p  / 100.0 if rmeas_p  is not None else None
-        cc_str = m.group(7).replace("*", "")
-        cc_val = safe_float(cc_str)
-        result["cc_half_overall"] = cc_val / 100.0 if cc_val is not None else None
+        shells.sort(key=lambda x: x[0])
+        hi_d, hi_tok = shells[0]
+        result["resolution_high"] = hi_d
+        try:
+            result["completeness_hi"] = clean_val(hi_tok[4]) if len(hi_tok) > 4 else None
+            result["rmerge_hi"]  = (clean_val(hi_tok[5]) / 100.0
+                                    if len(hi_tok) > 5 and clean_val(hi_tok[5]) else None)
+            result["rmeas_hi"]   = (clean_val(hi_tok[6]) / 100.0
+                                    if len(hi_tok) > 6 and clean_val(hi_tok[6]) else None)
+            result["isigi_hi"]   = clean_val(hi_tok[8]) if len(hi_tok) > 8 else None
+            cc_hi = clean_val(hi_tok[10]) if len(hi_tok) > 10 else None
+            if cc_hi is not None:
+                result["cc_half_hi"] = cc_hi / 100.0 if cc_hi > 1.0 else cc_hi
+        except (IndexError, ValueError, TypeError):
+            pass
 
     return result
+
 
 
 def merge_quality_score(stats: dict) -> float:
@@ -982,8 +1168,8 @@ def run_merge_trial(trial_dir: Path, hkl_entries: list,
         trial_dir / "XSCALE.INP",
         hkl_entries,
         resolution_high=resolution_high,
-        space_group_number=space_group_number,
-        unit_cell=unit_cell,
+        space_group_number=0,   # let XSCALE determine symmetry
+        unit_cell="",           # let XSCALE determine cell
     )
     rc = run_xscale(trial_dir)
     stats = parse_xscale_lp(trial_dir)
@@ -1115,6 +1301,15 @@ def greedy_subset_search(candidates: list, trials_dir: Path,
                 "  - REJECTED %-28s  trial=%.4f  best=%.4f",
                 candidate["name"], trial_score, best_score,
             )
+            # If trial score is 0, show why XSCALE failed
+            if trial_score == 0.0 and trial_stats.get("xscale_rc") == 0:
+                lp = trial_dir / "XSCALE.LP"
+                if lp.exists():
+                    # Show the total line so we can see what XSCALE produced
+                    for line in lp.read_text(errors="replace").splitlines():
+                        if "total" in line.lower() or "error" in line.lower():
+                            log.info("    XSCALE.LP: %s", line.strip())
+                            break
 
     return current_subset, best_stats
 
@@ -1230,29 +1425,48 @@ def parse_integrate_lp_frames(root: Path) -> list:
 
 
 def find_bad_frames(frames: list,
-                    isigi_threshold: float = 1.0,
-                    frac_threshold:  float = 0.3) -> list:
+                    isigi_threshold: float = 0.1,
+                    frac_threshold:  float = 0.05,
+                    max_bad_fraction: float = 0.30) -> list:
     """
     Identify frames that should be excluded from CORRECT.
 
-    A frame is considered bad if:
-      - its mean I/sigma is below isigi_threshold (default 1.0), OR
-      - its fraction of observed reflections is below frac_threshold (default 0.3)
+    Very conservative thresholds are used -- removing too many frames from
+    a microED dataset (which has few frames to begin with) is worse than
+    keeping some weak ones. Only frames that are clearly broken are excluded.
 
-    Returns a sorted list of bad frame numbers.
+    Rules:
+      - Frame number must be > 0 (frame 0 is invalid -- parser matched wrong row)
+      - Both I/sigma AND fraction_observed must be below threshold simultaneously
+      - Never exclude more than max_bad_fraction (30%) of total frames
     """
     if not frames:
         return []
 
+    total_frames = len(frames)
     bad = []
+
     for f in frames:
+        frame_num = f.get("frame", 0)
+        if frame_num <= 0:
+            continue   # invalid frame number -- skip
+
         isigi = f.get("isigi_mean")
         frac  = f.get("fraction_observed")
-        if (isigi is not None and isigi < isigi_threshold) or            (frac  is not None and frac  < frac_threshold):
-            bad.append(f["frame"])
+
+        # Only exclude when BOTH metrics are clearly bad simultaneously
+        if (isigi is not None and isigi < isigi_threshold and
+                frac is not None and frac < frac_threshold):
+            bad.append(frame_num)
+
+    # Safety cap: never exclude more than 30% of frames
+    max_to_exclude = max(1, int(total_frames * max_bad_fraction))
+    if len(bad) > max_to_exclude:
+        log.info("  Frame exclusion capped at %d/%d (30%% safety limit).",
+                 max_to_exclude, total_frames)
+        bad = sorted(bad)[:max_to_exclude]
 
     return sorted(bad)
-
 
 def add_exclude_frames(root: Path, bad_frames: list) -> None:
     """
@@ -1552,6 +1766,157 @@ def get_processed_subdirs(parent_dir: Path) -> set:
     return done
 
 
+
+# ===========================================================================
+# Smart pre-filtering: find the dominant crystal form automatically
+# ===========================================================================
+
+def find_dominant_crystal_form(candidates: list,
+                                sigma_cutoff: float = 2.0) -> tuple:
+    """
+    Identify the dominant crystal form by statistical outlier detection.
+
+    For each of the six unit cell parameters, compute the median and
+    median absolute deviation (MAD) across all candidates that have valid
+    cell values. Any dataset whose cell differs from the median by more than
+    sigma_cutoff * MAD is flagged as an outlier and excluded.
+
+    This approach is more robust than a fixed tolerance because it adapts
+    to the actual spread of your data rather than requiring you to know
+    the expected cell in advance.
+
+    Parameters
+    ----------
+    candidates   : list of candidate dicts with keys a,b,c,alpha,beta,gamma
+    sigma_cutoff : datasets more than this many MADs from median are excluded
+                   (default 2.0 -- catches clear outliers without over-filtering)
+
+    Returns
+    -------
+    (clean, rejected, consensus_cell) where:
+        clean         : list of candidates that passed all filters
+        rejected      : list of (candidate, reason) tuples
+        consensus_cell: dict with median a,b,c,alpha,beta,gamma values
+    """
+    import statistics
+
+    param_names = ("a", "b", "c", "alpha", "beta", "gamma")
+
+    # Collect numeric cell values for each parameter
+    param_values = {p: [] for p in param_names}
+    valid_indices = []
+
+    for i, c in enumerate(candidates):
+        try:
+            vals = {p: float(c.get(p) or "n/a") for p in param_names}
+            for p in param_names:
+                param_values[p].append(vals[p])
+            valid_indices.append(i)
+        except (TypeError, ValueError):
+            pass  # cell has n/a values -- will be caught later
+
+    if len(valid_indices) < 2:
+        # Not enough data to do statistics -- keep everything
+        return candidates, [], {}
+
+    # Compute median and MAD for each parameter
+    medians = {}
+    mads    = {}
+    for p in param_names:
+        vals   = param_values[p]
+        median = statistics.median(vals)
+        mad    = statistics.median([abs(v - median) for v in vals])
+        # Use a minimum MAD to avoid division by zero for very tight clusters
+        mads[p]    = max(mad, 0.1)
+        medians[p] = median
+
+    consensus_cell = {p: round(medians[p], 3) for p in param_names}
+
+    # Score each candidate against the consensus
+    clean    = []
+    rejected = []
+
+    for c in candidates:
+        try:
+            vals = {p: float(c.get(p) or "n/a") for p in param_names}
+        except (TypeError, ValueError):
+            rejected.append((c, "no valid unit cell parameters"))
+            continue
+
+        # Find worst-offending parameter
+        deviations = {
+            p: abs(vals[p] - medians[p]) / mads[p]
+            for p in param_names
+        }
+        worst_param = max(deviations, key=deviations.get)
+        worst_dev   = deviations[worst_param]
+
+        if worst_dev > sigma_cutoff:
+            reason = (
+                f"{worst_param}: value={vals[worst_param]:.2f}  "
+                f"median={medians[worst_param]:.2f}  "
+                f"deviation={worst_dev:.1f} MADs (cutoff={sigma_cutoff})"
+            )
+            rejected.append((c, reason))
+        else:
+            clean.append(c)
+
+    return clean, rejected, consensus_cell
+
+
+def quality_score_from_row(row: dict) -> float:
+    """
+    Compute a quality score from actual CORRECT.LP statistics when available,
+    falling back to indexing metrics when they are not.
+
+    Priority order:
+      1. Real merged statistics (completeness, CC1/2, I/sigma, Rmeas)
+         -- these are the most meaningful quality indicators
+      2. Indexing fraction and HKL presence
+         -- used when CORRECT.LP stats are missing or zero
+
+    Returns a score in [0, 1], higher is better.
+    """
+    score = 0.0
+    has_real_stats = False
+
+    # --- Real CORRECT.LP statistics ---
+    comp = safe_float(row.get("completeness_overall"), None)
+    cc   = safe_float(row.get("cc_half_overall"),      None)
+    isig = safe_float(row.get("isigi_overall"),        None)
+    rmeas = safe_float(row.get("rmeas_overall"),       None)
+
+    # Only use real stats if they look valid (not zero or -99.9)
+    if comp and comp > 0:
+        score += 0.40 * min(comp / 100.0, 1.0)
+        has_real_stats = True
+    if cc and cc > 0:
+        score += 0.25 * max(0.0, min(cc, 1.0))
+        has_real_stats = True
+    if isig and isig > 0:
+        score += 0.20 * min(isig / 20.0, 1.0)
+        has_real_stats = True
+    if rmeas and 0 < rmeas < 0.5:
+        score += 0.10 * max(0.0, 1.0 - rmeas / 0.5)
+        has_real_stats = True
+
+    # --- Indexing fallback ---
+    if not has_real_stats:
+        try:
+            frac = float(row.get("idxref_fraction") or 0)
+            score += 0.50 * min(frac, 1.0)
+        except (TypeError, ValueError):
+            pass
+        if str(row.get("has_hkl", "NO")).upper() == "YES":
+            score += 0.35
+        try:
+            cnn_q = float(row.get("cnn_quality_score") or 0)
+            score += 0.15 * min(cnn_q, 1.0)
+        except (TypeError, ValueError):
+            pass
+
+    return round(min(score, 1.0), 4)
+
 # ===========================================================================
 # Main pipeline
 # ===========================================================================
@@ -1575,6 +1940,46 @@ def _write_csv(csv_path: Path, csv_rows: list) -> None:
         writer.writeheader()
         writer.writerows(csv_rows)
 
+
+def clean_xds_output(root_path: Path) -> None:
+    """
+    Delete all XDS output files from a previous run, keeping only the
+    raw .img files and the backup folder.
+
+    This ensures the pipeline always starts fresh rather than picking up
+    stale output from a previous run that used different parameters.
+
+    Files removed: all XDS output (.LP, .HKL, .cbf, .XDS, SPOT.XDS etc.)
+    Files kept: *.img files, *_backup/ folder
+    """
+    # XDS output file patterns to remove
+    xds_patterns = [
+        "*.LP", "*.cbf", "*.XDS", "*.HKL",
+        "SPOT.XDS", "XDS.INP", "*.xml",
+        "dials", "arcimboldo",
+    ]
+    removed = 0
+    for pattern in xds_patterns:
+        for f in root_path.glob(pattern):
+            try:
+                if f.is_dir():
+                    shutil.rmtree(f)
+                else:
+                    f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    # Also remove the log subfolder (will be recreated)
+    log_dir = root_path / "log"
+    if log_dir.exists():
+        try:
+            shutil.rmtree(log_dir)
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        log.info("  Cleaned %d old XDS file(s) from previous run.", removed)
+
 def process_one_dataset(args_tuple):
     """
     Process a single dataset through all XDS steps.
@@ -1587,7 +1992,8 @@ def process_one_dataset(args_tuple):
 
     log.info("\n=== Processing: %s ===", root_path)
 
-    # Step 1 -- Rename
+    # Step 1 -- Clean old XDS output then rename images
+    clean_xds_output(root_path)
     try:
         img_files = rename_and_backup(root_path, subdir_name)
     except FileExistsError as exc:
@@ -1606,37 +2012,76 @@ def process_one_dataset(args_tuple):
         log.error("  Cannot read header: %s -- skipping.", exc)
         return None
 
-    distance       = safe_float(header.get("DETECTOR_DISTANCE", 1304.067765), 1304.067765)
-    wavelength     = safe_float(header.get("WAVELENGTH", 0.025082), 0.025082)
-    _ORGX_DEFAULT  = 1043.0
-    _ORGY_DEFAULT  = 1046.0
-    orgx_h = safe_float(header.get("ORGX", _ORGX_DEFAULT), _ORGX_DEFAULT)
-    orgy_h = safe_float(header.get("ORGY", _ORGY_DEFAULT), _ORGY_DEFAULT)
-    if abs(orgx_h - _ORGX_DEFAULT) < 100 and abs(orgy_h - _ORGY_DEFAULT) < 100:
-        orgx, orgy = orgx_h, orgy_h
-    else:
-        orgx, orgy = _ORGX_DEFAULT, _ORGY_DEFAULT
-        log.info("  Header beam centre suspicious -- using instrument default (%.1f, %.1f).", orgx, orgy)
-    starting_angle = safe_float(header.get("STARTING_ANGLE", 0.0), 0.0)
+    # Detector distance: try multiple header key names (instrument-dependent)
+    # UCSC: DETECTOR_DISTANCE   Johnstone lab: DISTANCE
+    distance = (
+        safe_float(header.get("DETECTOR_DISTANCE"), None) or
+        safe_float(header.get("DISTANCE"), None) or
+        787.953834
+    )
+
+    wavelength  = safe_float(header.get("WAVELENGTH", 0.025082), 0.025082)
+    # Beam centre: hardcoded to instrument values, header is ignored.
+    # ORGX=1043, ORGY=1046 are the calibrated values for this microscope.
+    # These are intentionally asymmetric and must not be changed to 1024/1024.
+    orgx, orgy = 1043.0, 1046.0
+
+    # Starting angle: try both key names
+    starting_angle = (
+        safe_float(header.get("OSC_START"), None) or
+        safe_float(header.get("STARTING_ANGLE"), None) or
+        0.0
+    )
     log.info("  dist=%.2fmm  wl=%.6fA  ORGX=%.1f  ORGY=%.1f  angle=%.3f",
               distance, wavelength, orgx, orgy, starting_angle)
 
-    # Step 3 -- XDS.INP
+    # Step 3 -- Clean up any existing XDS output files so we always start fresh.
+    # This ensures old results from a previous run don't interfere.
+    XDS_OUTPUT_FILES = [
+        "XDS.INP", "XPARM.XDS", "GXPARM.XDS", "IDXREF.LP", "COLSPOT.LP",
+        "XYCORR.LP", "INIT.LP", "DEFPIX.LP", "INTEGRATE.LP", "INTEGRATE.HKL",
+        "CORRECT.LP", "XDS_ASCII.HKL", "SPOT.XDS",
+        "BKGINIT.cbf", "BKGPIX.cbf", "BLANK.cbf", "DECAY.cbf",
+        "MODPIX.cbf", "ABS.cbf", "ABSORP.cbf", "GAIN.cbf",
+        "X-CORRECTIONS.cbf", "Y-CORRECTIONS.cbf",
+        "DX-CORRECTIONS.cbf", "DY-CORRECTIONS.cbf",
+        "GX-CORRECTIONS.cbf", "GY-CORRECTIONS.cbf",
+        "SHOW_BKG.cbf", "SHOW_HKL.cbf",
+    ]
+    cleaned = []
+    for fname in XDS_OUTPUT_FILES:
+        fpath = root_path / fname
+        if fpath.exists():
+            fpath.unlink()
+            cleaned.append(fname)
+    # Also remove the log directory from previous runs
+    log_dir_old = root_path / "log"
+    if log_dir_old.exists():
+        shutil.rmtree(log_dir_old)
+    if cleaned:
+        log.info("  Cleaned %d existing XDS file(s) for fresh run.", len(cleaned))
+
+    # Now generate a fresh XDS.INP
     log_dir = root_path / "log"
     log_dir.mkdir(exist_ok=True)
-    if not (root_path / "XDS.INP").exists():
-        generate_xds_inp(root_path, subdir_name, n_images,
-                         orgx, orgy, distance, wavelength,
-                         starting_angle=starting_angle)
-    else:
-        patch_xds_inp(root_path, subdir_name, n_images, orgx, orgy)
+    generate_xds_inp(root_path, subdir_name, n_images,
+                     orgx, orgy, distance, wavelength,
+                     starting_angle=starting_angle)
 
     # Step 4 -- Phase 1
     if not check_images_accessible(root_path, img_files):
         log.error("  Image check failed -- skipping.")
         return None
     log_idxref = log_dir / f"{subdir_name}_XDS_idxref.log"
-    log.info("  Running Phase 1 (XYCORR INIT COLSPOT IDXREF)...")
+    # Step 4a: Adaptive spot size test
+    # Try MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT = 3, 4, 6 and keep the best.
+    # This runs XYCORR INIT COLSPOT IDXREF three times but only takes ~30s
+    # extra and can significantly improve the number of indexed spots.
+    log.info("  Finding optimal MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT...")
+    best_px = adaptive_spot_size(root_path, subdir_name, n_images, log_dir)
+
+    log.info("  Running Phase 1 (XYCORR INIT COLSPOT IDXREF) with PIXELS=%d...",
+             best_px)
     t0 = time.time()
     rc1 = run_xds(root_path, "XYCORR INIT COLSPOT IDXREF", log_idxref)
     log.info("  Phase 1 done in %.1f s  (exit %d)", time.time() - t0, rc1)
@@ -1795,6 +2240,20 @@ def main():
     log.info("Parallel workers : %d", args.workers)
     log.info("Watch mode       : %s", args.watch)
 
+    # Save all terminal output to a timestamped log file in the parent folder.
+    # A new file is created every run so previous logs are never overwritten.
+    # e.g. test16_20260510_143022.log
+    import datetime
+    timestamp    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = parent_dir / f"{parent_dir.name}_{timestamp}.log"
+    file_handler = logging.FileHandler(log_filename)
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%H:%M:%S"
+    ))
+    logging.getLogger().addHandler(file_handler)
+    log.info("Log file: %s", log_filename)
+
     xds_on_path = check_xds_available()
     if not xds_on_path:
         log.warning("xds_par not found -- XDS.INP files will be written but not run.")
@@ -1906,27 +2365,88 @@ def main():
         else:
             csv_rows = run_batch(all_datasets, args.workers, csv_rows)
 
+    # -----------------------------------------------------------------------
+    # Second pass: re-index datasets using the consensus cell
+    # to correct any that XDS indexed to a wrong alternative lattice
+    # -----------------------------------------------------------------------
+    consensus_cell = compute_consensus_cell(csv_rows)
+    if consensus_cell and len(csv_rows) >= 3:
+        log.info("\nConsensus cell: a=%(a)s b=%(b)s c=%(c)s  alpha=%(alpha)s beta=%(beta)s gamma=%(gamma)s",
+                 consensus_cell)
+
+        tol_len = 1.5   # Angstroms
+        tol_ang = 3.0   # degrees
+        reindex_candidates = []
+        for row in csv_rows:
+            if str(row.get("has_hkl","NO")).upper() != "YES":
+                continue
+            try:
+                dl = max(abs(float(row[p]) - consensus_cell[p]) for p in ("a","b","c"))
+                da = max(abs(float(row[p]) - consensus_cell[p]) for p in ("alpha","beta","gamma"))
+                if dl > tol_len or da > tol_ang:
+                    reindex_candidates.append((row["subdirectory"], dl, da))
+            except (ValueError, TypeError, KeyError):
+                pass
+
+        if reindex_candidates:
+            log.info("  %d dataset(s) deviate from consensus -- attempting re-indexing:",
+                     len(reindex_candidates))
+            for name, dl, da in reindex_candidates:
+                log.info("    %s  Dlength=%.2fA  Dangle=%.1f deg", name, dl, da)
+
+            updated = []
+            for row in csv_rows:
+                if row["subdirectory"] not in [n for n,_,_ in reindex_candidates]:
+                    updated.append(row)
+                    continue
+                root_path = parent_dir / row["subdirectory"]
+                log_dir   = root_path / "log"
+                log_dir.mkdir(exist_ok=True)
+                old_frac  = float(row.get("idxref_fraction") or 0)
+                idx = reindex_with_reference_cell(root_path, row["subdirectory"],
+                                                   consensus_cell, log_dir)
+                new_frac = idx["indexed_fraction"] or 0.0
+                if new_frac > old_frac and (idx["indexed_spots"] or 0) > 0:
+                    log.info("  %s improved: %.1f%% -> %.1f%% indexed",
+                             row["subdirectory"], old_frac*100, new_frac*100)
+                    log_int = log_dir / f"{row['subdirectory']}_XDS_reindex_integrate.log"
+                    if run_xds(root_path, "DEFPIX INTEGRATE CORRECT", log_int) == 0:
+                        stats = parse_correct_lp(root_path)
+                        for k in ("a","b","c","alpha","beta","gamma",
+                                  "completeness_overall","rmeas_overall",
+                                  "isigi_overall","cc_half_overall"):
+                            if stats.get(k):
+                                row[k] = stats[k]
+                        row["idxref_fraction"] = f"{new_frac:.3f}"
+                        row["has_hkl"] = "YES" if (root_path/"XDS_ASCII.HKL").exists() else "NO"
+                        log.info("  Updated stats for %s: comp=%.1f%%",
+                                 row["subdirectory"],
+                                 stats.get("completeness_overall") or 0)
+                updated.append(row)
+            csv_rows = updated
+        else:
+            log.info("  All datasets consistent with consensus cell. No re-indexing needed.")
+
     # Write final CSV and summary
     csv_path = parent_dir / "cell_parameters_summary.csv"
     _write_csv(csv_path, csv_rows)
     log.info("\nCSV summary saved at %s", csv_path)
     log.info("Pipeline complete. Processed %d dataset(s).", len(csv_rows))
 
-    # -----------------------------------------------------------------------
-    # XSCALE: intelligent merging (Week 7 Tasks 7 & 8)
-    # -----------------------------------------------------------------------
-    # Build candidate list from csv_rows
-    csv_header = [
-        "subdirectory", "space_group",
-        "a", "b", "c", "alpha", "beta", "gamma",
-        "has_hkl",
-        "idxref_indexed", "idxref_total", "idxref_fraction", "idxref_hint",
-        "completeness_overall", "rmeas_overall", "isigi_overall", "cc_half_overall",
-        "completeness_hi", "rmeas_hi", "isigi_hi", "cc_half_hi",
-        "resolution_high", "resolution_low",
-        "cnn_a", "cnn_b", "cnn_c", "cnn_alpha", "cnn_beta", "cnn_gamma",
-        "cnn_quality_score", "cnn_disagreement", "cnn_flag_reason",
-    ]
+    print_summary_table(csv_rows)
+
+    # =======================================================================
+    # XSCALE: automated intelligent merging
+    # =======================================================================
+    # Step A: build candidate list from all datasets that have HKL files
+    # Step B: pre-filter to the dominant crystal form (statistical outliers out)
+    # Step C: rank clean datasets by actual quality metrics
+    # Step D: merge all clean datasets (baseline)
+    # Step E: greedy subset search to find the optimal combination
+    # Step F: print a final comparison table
+    # =======================================================================
+
+    # --- Step A: collect candidates ---
     candidates = []
     for row in csv_rows:
         if str(row.get("has_hkl", "NO")).strip().upper() != "YES":
@@ -1934,164 +2454,320 @@ def main():
         hkl_path = parent_dir / row["subdirectory"] / "XDS_ASCII.HKL"
         if not hkl_path.exists():
             continue
-        ind_score = score_individual_dataset(row)
+        quality = quality_score_from_row(row)
         candidates.append({
             "name":               row["subdirectory"],
             "hkl_path":           hkl_path,
-            "ind_score":          ind_score,
+            "ind_score":          quality,
             "space_group_number": row.get("space_group"),
-            "a": row.get("a"), "b": row.get("b"), "c": row.get("c"),
-            "alpha": row.get("alpha"), "beta": row.get("beta"),
+            "a":     row.get("a"),
+            "b":     row.get("b"),
+            "c":     row.get("c"),
+            "alpha": row.get("alpha"),
+            "beta":  row.get("beta"),
             "gamma": row.get("gamma"),
+            "completeness": safe_float(row.get("completeness_overall"), 0),
+            "rmeas":         safe_float(row.get("rmeas_overall"),        None),
+            "isigi":         safe_float(row.get("isigi_overall"),        0),
+            "cc_half":       safe_float(row.get("cc_half_overall"),      0),
+            "idxref_fraction": safe_float(row.get("idxref_fraction"),    0),
         })
 
     if not candidates:
-        log.info("\nNo datasets with XDS_ASCII.HKL -- skipping XSCALE.")
+        log.info("\nNo datasets with XDS_ASCII.HKL found -- skipping XSCALE.")
         return
 
-    log.info("\n%d dataset(s) eligible for merging:", len(candidates))
+    W = 72  # width for separator lines
+    sep  = "=" * W
+    sep2 = "-" * W
+
+    # ===================================================================
+    # DATASET QUALITY REPORT
+    # Show every dataset, its quality, and what happens to it
+    # ===================================================================
+    log.info("\n%s", sep)
+    log.info("  DATASET QUALITY REPORT  (%d datasets with HKL files)", len(candidates))
+    log.info("%s", sep)
+    log.info("  %-20s  %5s  %6s  %6s  %6s  %6s  %5s",
+             "Dataset", "Idx%", "Comp%", "I/sig", "a", "c", "Res(A)")
+    log.info("%s", sep2)
     for c in sorted(candidates, key=lambda x: x["ind_score"], reverse=True):
-        log.info("  pre_score=%.4f  SG=%s  %s",
-                 c["ind_score"], c.get("space_group_number"), c["name"])
+        # Get resolution from CORRECT.LP for this dataset
+        res_val = "n/a"
+        try:
+            lp = parent_dir / c["name"] / "CORRECT.LP"
+            if lp.exists():
+                s = parse_correct_lp(lp.parent)
+                r = s.get("resolution_high")
+                if r and float(r) > 0:
+                    res_val = f"{float(r):.2f}"
+        except Exception:
+            pass
+        log.info("  %-20s  %5.1f  %6.1f  %6.1f  %6s  %6s  %5s",
+                 c["name"],
+                 (c["idxref_fraction"] or 0) * 100,
+                 c["completeness"] or 0,
+                 c["isigi"] or 0,
+                 c.get("a") or "n/a",
+                 c.get("c") or "n/a",
+                 res_val)
+    log.info("%s", sep)
 
-    # Check space-group consistency before merging
-    sg, unit_cell_str, candidates = check_space_group_consistency(candidates)
+    # ===================================================================
+    # FILTER 1: Find the dominant crystal form
+    # Datasets with very different unit cells are wrong indexing solutions
+    # and will never merge correctly with the good ones
+    # ===================================================================
+    log.info("\n  FILTER 1: Removing datasets with incompatible unit cells")
+    log.info("%s", sep2)
+    clean, rejected, consensus = find_dominant_crystal_form(candidates, sigma_cutoff=3.0)
 
-    # Unit cell clustering: exclude datasets with significantly different cells
-    # even if they share the same space group number
-    candidates = cluster_by_unit_cell(candidates)
-    log.info("  Reference space group: %s  unit cell: %s", sg, unit_cell_str or "auto")
+    # Second tightening pass: within the "clean" set, remove any dataset
+    # whose cell deviates by more than an absolute tolerance from the consensus.
+    # This catches borderline cases that pass the MAD test but are still wrong.
+    ABS_LEN_TOL = 2.0   # Angstroms -- same compound = cells within 2A
+    ABS_ANG_TOL = 5.0   # degrees
+    if consensus:
+        tight_clean    = []
+        tight_rejected = list(rejected)
+        for c in clean:
+            try:
+                dl = max(abs(float(c.get(p,0)) - consensus[p])
+                         for p in ("a","b","c"))
+                da = max(abs(float(c.get(p,90)) - consensus[p])
+                         for p in ("alpha","beta","gamma"))
+                if dl > ABS_LEN_TOL or da > ABS_ANG_TOL:
+                    reason = (f"absolute deviation too large "
+                              f"(Δlength={dl:.2f}A tol={ABS_LEN_TOL}A, "
+                              f"Δangle={da:.1f}° tol={ABS_ANG_TOL}°)")
+                    tight_rejected.append((c, reason))
+                else:
+                    tight_clean.append(c)
+            except (ValueError, TypeError):
+                tight_clean.append(c)
+        if len(tight_clean) < len(clean):
+            log.info("  Absolute tolerance check removed %d more dataset(s).",
+                     len(clean) - len(tight_clean))
+        clean    = tight_clean
+        rejected = tight_rejected
 
-    if not candidates:
-        log.warning("No consistent datasets remain after space-group check.")
+    if consensus:
+        log.info("  Target cell:  a=%(a)s  b=%(b)s  c=%(c)s  "
+                 "alpha=%(alpha)s  beta=%(beta)s  gamma=%(gamma)s", consensus)
+    log.info("%s", sep2)
+
+    for c, reason in rejected:
+        log.info("  EXCLUDED  %-20s  Wrong cell -- %s", c["name"], reason)
+    for c in clean:
+        log.info("  KEPT      %-20s  Cell matches consensus", c["name"])
+    log.info("%s", sep2)
+    log.info("  Result: %d kept, %d excluded", len(clean), len(rejected))
+
+    if not clean:
+        log.warning("  All datasets excluded -- check data quality.")
         return
 
-    # Determine resolution high limit: use median of individual dataset limits
-    res_limits = [safe_float(c.get("resolution_high"), None)
-                  for c in candidates
-                  if safe_float(c.get("resolution_high"), None) is not None]
-    if res_limits:
-        res_limits.sort()
-        resolution_high = res_limits[len(res_limits) // 2]   # median
+    # ===================================================================
+    # FILTER 2: Rank by quality within the compatible set
+    # Datasets that indexed well and have higher completeness go first
+    # ===================================================================
+    log.info("\n  FILTER 2: Ranking compatible datasets by quality")
+    log.info("%s", sep2)
+    clean_sorted = sorted(clean, key=lambda c: c["ind_score"], reverse=True)
+    sg, unit_cell_str, clean_sorted = check_space_group_consistency(clean_sorted)
+
+    for rank, c in enumerate(clean_sorted, 1):
+        log.info("  #%d  score=%.3f  idx=%4.1f%%  comp=%4.1f%%  %s",
+                 rank,
+                 c["ind_score"],
+                 (c["idxref_fraction"] or 0) * 100,
+                 c["completeness"] or 0,
+                 c["name"])
+    log.info("%s", sep2)
+
+    # Resolution limit
+    hi_res_vals = []
+    for c in clean_sorted:
+        lp = c["hkl_path"].parent / "CORRECT.LP"
+        if lp.exists():
+            s = parse_correct_lp(lp.parent)
+            v = safe_float(s.get("resolution_high"), None)
+            if v and v > 0.5:
+                hi_res_vals.append(v)
+    if hi_res_vals:
+        hi_res_vals.sort()
+        resolution_high = hi_res_vals[len(hi_res_vals) // 2]
     else:
         resolution_high = 2.0
-    log.info("  Merging to resolution: %.2f A", resolution_high)
+
+    log.info("  Space group: %s   Resolution: %.2f A   Unit cell: %s",
+             sg or "auto", resolution_high, unit_cell_str or "auto")
 
     xscale_dir = parent_dir / "xscale"
     xscale_dir.mkdir(exist_ok=True)
     xscale_available = bool(shutil.which("xscale_par"))
-
     if not xscale_available:
-        log.warning("xscale_par not found on PATH.")
-        log.warning("XSCALE.INP files will be written but not executed.")
+        log.warning("  xscale_par not on PATH -- INP files written but not run.")
 
-    # -- Merge 1: all datasets (baseline reference) --
-    all_dir = xscale_dir / "all_datasets"
+    # ===================================================================
+    # MERGE A: All compatible datasets
+    # Baseline reference -- includes every dataset that passed Filter 1
+    # ===================================================================
+    log.info("\n%s", sep)
+    log.info("  MERGE A: All %d compatible datasets (baseline)", len(clean_sorted))
+    log.info("%s", sep2)
+    all_dir = xscale_dir / "all_compatible"
     all_dir.mkdir(exist_ok=True)
-    all_entries = [{"hkl_path": c["hkl_path"], "name": c["name"]} for c in candidates]
+    all_entries = [{"hkl_path": c["hkl_path"], "name": c["name"]}
+                   for c in clean_sorted]
     write_xscale_inp(all_dir / "XSCALE.INP", all_entries,
                      resolution_high=resolution_high,
-                     space_group_number=sg,
-                     unit_cell=unit_cell_str)
-    log.info("\nXSCALE all_datasets: XSCALE.INP written -> %s", all_dir)
+                     space_group_number=0,
+                     unit_cell="")  # let XSCALE determine cell from input HKLs
 
+    all_stats = {}
     if xscale_available:
-        rc_all = run_xscale(all_dir)
-        all_stats = parse_xscale_lp(all_dir)
-        if rc_all == 0:
-            log.info(
-                "all_datasets: comp=%.1f%%  Rmeas=%.3f  CC½=%.3f  "
-                "I/sig=%.1f  n_unique=%s",
-                all_stats.get("completeness_overall") or 0,
-                all_stats.get("rmeas_overall")         or 0,
-                all_stats.get("cc_half_overall")       or 0,
-                all_stats.get("isigi_overall")         or 0,
-                all_stats.get("n_unique_overall"),
-            )
-            log.info(
-                "all_datasets hi-shell: comp=%.1f%%  Rmeas=%.3f  "
-                "CC½=%.3f  I/sig=%.1f",
-                all_stats.get("completeness_hi") or 0,
-                all_stats.get("rmeas_hi")        or 0,
-                all_stats.get("cc_half_hi")      or 0,
-                all_stats.get("isigi_hi")        or 0,
-            )
+        rc = run_xscale(all_dir)
+        if rc == 0:
+            all_stats = parse_xscale_lp(all_dir)
+            log.info("  Datasets : %s",
+                     ", ".join(c["name"] for c in clean_sorted))
+            log.info("  comp=%.1f%%  Rmeas=%.3f  CC1/2=%.3f  I/sig=%.1f  n_unique=%s",
+                     all_stats.get("completeness_overall") or 0,
+                     all_stats.get("rmeas_overall")        or 0,
+                     all_stats.get("cc_half_overall")      or 0,
+                     all_stats.get("isigi_overall")        or 0,
+                     all_stats.get("n_unique_overall") or "n/a")
+            # Diagnose if stats still show zero
+            if not all_stats.get("completeness_overall"):
+                log.warning("  WARNING: XSCALE ran but stats are 0 -- showing XSCALE.LP tail:")
+                lp_tail = tail_log(all_dir / "XSCALE.LP", n=30)
+                log.warning("%s", lp_tail)
         else:
-            log.warning("all_datasets XSCALE exit code %d", rc_all)
+            log.warning("  XSCALE exit code %d -- see %s", rc, all_dir / "xscale.log")
+            log.warning("%s", tail_log(all_dir / "xscale.log"))
 
-    # -- Merge 2: optimal subset via greedy forward selection --
-    opt_dir = xscale_dir / "optimal"
+    # ===================================================================
+    # MERGE B: Optimal subset (greedy forward selection)
+    # Tests adding each dataset one at a time and only keeps it if the
+    # merged statistics actually improve. Bad datasets are rejected here
+    # even if their unit cell looked compatible.
+    # ===================================================================
+    opt_dir    = xscale_dir / "optimal"
     opt_dir.mkdir(exist_ok=True)
+    opt_stats  = {}
+    opt_subset = clean_sorted
 
-    if xscale_available and len(candidates) > 1:
-        log.info("\nRunning greedy subset search...")
+    if xscale_available and len(clean_sorted) > 1:
+        log.info("\n%s", sep)
+        log.info("  MERGE B: Finding optimal subset (greedy search)")
+        log.info("  Testing each dataset -- only kept if it improves the merge")
+        log.info("%s", sep2)
+
         trials_dir = xscale_dir / "trials"
         trials_dir.mkdir(exist_ok=True)
-
-        optimal_subset, opt_stats = greedy_subset_search(
-            candidates, trials_dir,
+        opt_subset, opt_stats = greedy_subset_search(
+            clean_sorted, trials_dir,
             resolution_high=resolution_high,
             space_group_number=sg,
             unit_cell=unit_cell_str,
         )
 
-        log.info("\nOptimal subset (%d / %d datasets):", len(optimal_subset), len(candidates))
-        for c in optimal_subset:
-            log.info("  pre_score=%.4f  %s", c["ind_score"], c["name"])
-        log.info(
-            "Optimal merge: comp=%.1f%%  Rmeas=%.3f  CC½=%.3f  "
-            "I/sig=%.1f  n_unique=%s",
-            opt_stats.get("completeness_overall") or 0,
-            opt_stats.get("rmeas_overall")        or 0,
-            opt_stats.get("cc_half_overall")      or 0,
-            opt_stats.get("isigi_overall")        or 0,
-            opt_stats.get("n_unique_overall"),
-        )
-        log.info(
-            "Optimal hi-shell: comp=%.1f%%  Rmeas=%.3f  CC½=%.3f  I/sig=%.1f",
-            opt_stats.get("completeness_hi") or 0,
-            opt_stats.get("rmeas_hi")        or 0,
-            opt_stats.get("cc_half_hi")      or 0,
-            opt_stats.get("isigi_hi")        or 0,
-        )
+        kept     = [c["name"] for c in opt_subset]
+        dropped  = [c["name"] for c in clean_sorted if c not in opt_subset]
 
-        # Final clean run in opt_dir
+        log.info("%s", sep2)
+        for c in opt_subset:
+            log.info("  ACCEPTED  %-20s  Improved the merge", c["name"])
+        for name in dropped:
+            log.info("  DROPPED   %-20s  Did not improve the merge", name)
+        log.info("%s", sep2)
+
+        # Final clean run with accepted datasets only
         opt_entries = [{"hkl_path": c["hkl_path"], "name": c["name"]}
-                       for c in optimal_subset]
+                       for c in opt_subset]
         write_xscale_inp(opt_dir / "XSCALE.INP", opt_entries,
                          resolution_high=resolution_high,
-                         space_group_number=sg,
-                         unit_cell=unit_cell_str)
+                         space_group_number=0,
+                         unit_cell="")  # let XSCALE determine cell
         rc_opt = run_xscale(opt_dir)
         if rc_opt == 0:
-            log.info("Optimal XSCALE run complete -> %s", opt_dir / "XSCALE.HKL")
+            opt_stats = parse_xscale_lp(opt_dir)
+            log.info("  Datasets : %s", ", ".join(kept))
+            log.info("  comp=%.1f%%  Rmeas=%.3f  CC1/2=%.3f  I/sig=%.1f  n_unique=%s",
+                     opt_stats.get("completeness_overall") or 0,
+                     opt_stats.get("rmeas_overall")        or 0,
+                     opt_stats.get("cc_half_overall")      or 0,
+                     opt_stats.get("isigi_overall")        or 0,
+                     opt_stats.get("n_unique_overall") or "n/a")
         else:
-            log.warning("Optimal XSCALE exit code %d -- see %s",
+            log.warning("  XSCALE exit code %d -- see %s",
                         rc_opt, opt_dir / "xscale.log")
-
-    elif len(candidates) == 1:
-        log.info("\nOnly one dataset -- writing single-dataset XSCALE.INP.")
-        write_xscale_inp(opt_dir / "XSCALE.INP",
-                         [{"hkl_path": candidates[0]["hkl_path"],
-                           "name": candidates[0]["name"]}],
+    elif len(clean_sorted) == 1:
+        log.info("\n  Only one compatible dataset -- no subset search needed.")
+        opt_entries = [{"hkl_path": clean_sorted[0]["hkl_path"],
+                        "name": clean_sorted[0]["name"]}]
+        write_xscale_inp(opt_dir / "XSCALE.INP", opt_entries,
                          resolution_high=resolution_high,
                          space_group_number=sg,
                          unit_cell=unit_cell_str)
         if xscale_available:
             run_xscale(opt_dir)
 
-    else:
-        # XSCALE not available -- write best-guess INP ranked by individual score
-        log.info("\nWriting best-guess XSCALE.INP (greedy search needs xscale_par).")
-        ranked = sorted(candidates, key=lambda c: c["ind_score"], reverse=True)
-        entries = [{"hkl_path": c["hkl_path"], "name": c["name"]} for c in ranked]
-        write_xscale_inp(opt_dir / "XSCALE.INP", entries,
-                         resolution_high=resolution_high,
-                         space_group_number=sg,
-                         unit_cell=unit_cell_str)
-        log.info("Run manually: cd %s && xscale_par", opt_dir)
+    # ===================================================================
+    # FINAL SUMMARY
+    # ===================================================================
+    log.info("\n%s", sep)
+    log.info("  FINAL SUMMARY")
+    log.info("%s", sep)
 
-    log.info("\nAll XSCALE output is in: %s", xscale_dir)
+    all_names  = [c["name"] for c in candidates]
+    bad_names  = [c["name"] for c, _ in rejected]
+    good_names = [c["name"] for c in clean_sorted]
+    opt_names  = [c["name"] for c in opt_subset]
+
+    log.info("  Total datasets processed : %d", len(all_names))
+    log.info("  Excluded (wrong cell)    : %d  -- %s",
+             len(bad_names), ", ".join(bad_names) if bad_names else "none")
+    log.info("  Compatible datasets      : %d  -- %s",
+             len(good_names), ", ".join(good_names))
+    log.info("  Optimal subset           : %d  -- %s",
+             len(opt_names), ", ".join(opt_names))
+    log.info("%s", sep)
+
+    if all_stats and opt_stats:
+        log.info("  %-22s  %6s  %6s  %6s  %6s  %8s  %6s",
+                 "Merge", "Comp%", "Rmeas", "CC1/2", "I/sig", "N_uniq", "Res(A)")
+        log.info("%s", sep2)
+        def _fmt(label, s, res=None):
+            log.info("  %-22s  %6.1f  %6.3f  %6.3f  %6.1f  %8s  %6s",
+                     label,
+                     s.get("completeness_overall") or 0,
+                     s.get("rmeas_overall")        or 0,
+                     s.get("cc_half_overall")      or 0,
+                     s.get("isigi_overall")        or 0,
+                     str(s.get("n_unique_overall") or "n/a"),
+                     f"{res:.2f}" if res else "n/a")
+        _fmt(f"All compatible ({len(good_names)})", all_stats, resolution_high)
+        _fmt(f"Optimal ({len(opt_names)})",          opt_stats, resolution_high)
+        log.info("%s", sep2)
+
+    log.info("%s", sep)
+    log.info("  DATA SUMMARY")
+    log.info("%s", sep2)
+    log.info("  Resolution limit : %.2f Angstroms", resolution_high)
+    log.info("  Space group      : %s", sg or "1 (P1)")
+    if unit_cell_str:
+        parts = unit_cell_str.split()
+        if len(parts) == 6:
+            log.info("  Unit cell        : a=%-7s b=%-7s c=%-7s",
+                     parts[0], parts[1], parts[2])
+            log.info("                     alpha=%-5s beta=%-5s gamma=%-5s",
+                     parts[3], parts[4], parts[5])
+    log.info("%s", sep2)
+    log.info("  File to use for structure determination:")
+    log.info("  --> %s", opt_dir / "XSCALE.HKL")
+    log.info("%s", sep)
 
 
 if __name__ == "__main__":
