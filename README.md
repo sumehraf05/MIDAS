@@ -1,9 +1,8 @@
 # MIDAS: Micro-Electron Diffraction Integrated Data Automation System
 
 An automated pipeline for processing Micro-Electron Diffraction (microED)
-datasets. The workflow completely handles everything from raw image files
-through to an optimally merged final dataset, without requiring user
-intervention.
+datasets. The workflow completely handles from raw image files throughout 
+optimally merged final dataset with minimum user intervention.
 
 ---
 
@@ -217,8 +216,8 @@ processing to train it on your own data.
 
 ## Instrument Configuration
 
-The default XDS.INP template is configured for the UCSC cryo-EM facility
-using a ThermoFisher CETA 16M detector operated in 2×2 binning mode.
+The default XDS.INP template is configured for the UCSC Biomolecular Cryo-EM Facility using a 
+ThermoFisher Scientific Glacios 200 kV cryo-TEM coupled to a CETA 16M detector operated in 2×2 binning mode.
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
