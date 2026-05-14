@@ -47,6 +47,35 @@ process:
 ---
 
 ## Requirements
+ 
+### 1. Install Anaconda or Miniconda
+ 
+Download from https://www.anaconda.com/download or https://docs.conda.io/en/latest/miniconda.html
+ 
+### 2. Create the conda environments
+ 
+The pipeline uses two environments:
+ 
+**`xds`** — for running the main pipeline:
+```bash
+conda create -n xds
+conda activate xds
+conda install -c conda-forge watchdog fabio numpy
+pip install torch torchvision
+```
+ 
+**`xds_env`** — for auxiliary processing:
+```bash
+conda create -n xds_env
+conda activate xds_env
+conda install -c conda-forge fabio h5py numpy
+```
+ 
+### 3. Activate the environment before running
+ 
+```bash
+conda activate xds
+```
 
 ### Python packages
 
