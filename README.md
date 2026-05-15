@@ -47,36 +47,34 @@ process:
 ---
 
 ## Requirements
- 
+
 ### 1. Install Anaconda or Miniconda
- 
+
 Download from https://www.anaconda.com/download or https://docs.conda.io/en/latest/miniconda.html
- 
+
 ### 2. Create the conda environments
- 
+
 The pipeline uses two environments:
- 
+
 **`xds`** — for running the main pipeline:
 ```bash
 conda create -n xds
 conda activate xds
 conda install -c conda-forge watchdog fabio numpy
-pip install torch torchvision
+conda install -c pytorch pytorch torchvision
 ```
- 
+
+> **Note:** Install `torch` and `torchvision` via conda rather than pip.
+> Using `pip install torch` inside a conda environment can cause import
+> errors even when the installation appears to succeed.
+
 ### 3. Activate the environment before running
- 
+
 ```bash
 conda activate xds
 ```
 
-### Python packages
-
-```bash
-pip install fabio torch torchvision numpy
-```
-
-### XDS
+### 4. Install XDS
 
 XDS must be installed and on your PATH. Download from https://xds.mr.mpg.de
 
@@ -92,6 +90,12 @@ export PATH=~/XDS-gfortran_Linux_x86_64:$PATH
 which xds_par
 xds_par | head -4
 ```
+
+### 5. Optional: CCP4 + SHELX (for structure solution)
+
+CCP4 is required to run `structure_solution.py`. Download from
+https://www.ccp4.ac.uk. This provides `pointless`, `mtz2various`,
+`shelxt`, and `shelxl`.
 
 ---
 
@@ -238,8 +242,9 @@ processing to train it on your own data.
 
 ## Instrument Configuration
 
-The default XDS.INP template is configured for the UCSC Biomolecular Cryo-EM Facility using a 
-ThermoFisher Scientific Glacios 200 kV cryo-TEM coupled to a CETA 16M detector operated in 2×2 binning mode.
+The default XDS.INP template is configured for the UCSC Biomolecular Cryo-EM
+Facility using a ThermoFisher Scientific Glacios 200 kV cryo-TEM coupled to
+a CETA 16M detector operated in 2×2 binning mode.
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
@@ -279,18 +284,13 @@ Normal for individual microED datasets — XSCALE merging builds redundancy.
 
 **CNN not loading:** Run `train_cnn.py` first. Pipeline still runs without it.
 
+**torch import error:** Make sure you installed torch via conda and not pip:
+```bash
+conda install -c pytorch pytorch torchvision
+```
+
 ---
 
-## License Distributed under the MIT License. See `LICENSE` for more information.
+## License
 
-MIT License — Copyright (c) 2026
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions: The above copyright
-notice and this permission notice shall be included in all copies or
-substantial portions of the Software. THE SOFTWARE IS PROVIDED "AS IS",
-WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.
+Distributed under the MIT License. See `LICENSE` for more information.
