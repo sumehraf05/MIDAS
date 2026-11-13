@@ -11,7 +11,7 @@ What it does:
     1.  Renames image files starting at 1 (rerun-safe, backs up originals)
     2.  Reads detector parameters from image headers (distance, wavelength,
         starting angle) and generates a per-dataset XDS.INP automatically
-    3.  Adaptive spot finding: tests MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT = 3, 4, 6
+    3.  Adaptive spot finding: tests MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT = 3, 4, 5, 6, 8
         and picks the value that gives the highest indexed fraction
     4.  Runs XDS Phase 1 (XYCORR INIT COLSPOT IDXREF) and auto-retries with
         relaxed parameters if indexing falls below 15%
@@ -29,7 +29,8 @@ What it does:
    11.  Computes consensus unit cell across all datasets and re-indexes any
         dataset that deviates, forcing it toward the true lattice
    12.  Identifies the dominant crystal form using MAD-based outlier detection
-        and filters incompatible datasets automatically
+        and filters incompatible datasets automatically (flagging likely
+        multi-lattice crystals separately from genuinely wrong indexing)
    13.  Ranks compatible datasets by quality score
    14.  Merges all compatible datasets with XSCALE (baseline)
    15.  Greedy forward selection: finds the optimal subset of datasets that
@@ -42,15 +43,25 @@ What it does:
    19.  Supports parallel processing (--workers N), watch mode (--watch),
         and direct folder specification (--folder PATH)
 
+Instrument-specific parameters -- beam center, rotation axis, gain,
+oscillation range, detector distance/wavelength fallbacks, and untrusted
+detector regions -- are NOT hardcoded in this script. They come from an
+instrument config YAML passed with --config (see instrument_config.yaml
+for a template). These values drift between sessions (beam center) and
+vary by instrument/detector, so editing this script by hand to change
+them is no longer necessary.
+
 Usage:
-  python xds_pipeline.py                          # interactive prompt
-  python xds_pipeline.py --folder /path/to/data  # direct path
-  python xds_pipeline.py --workers 4             # parallel (4 crystals at once)
-  python xds_pipeline.py --watch                 # continuous monitoring mode
+  python xds_pipeline.py                                   # interactive prompt
+  python xds_pipeline.py --folder /path/to/data             # direct path
+  python xds_pipeline.py --folder /path/to/data --config instrument_config.yaml
+  python xds_pipeline.py --workers 4                        # parallel (4 crystals at once)
+  python xds_pipeline.py --watch                            # continuous monitoring mode
 
 Requirements:
   xds_par and xscale_par must be on your PATH.
   xdsconv must be on PATH for SHELX format conversion.
+  pyyaml must be installed for --config support (pip install pyyaml).
   See README.md for conda environment setup instructions.
 
 """
@@ -75,6 +86,7 @@ from microed_cnn import (
     compare_xds_and_cnn,
     CNNPrediction,
 )
+from instrument_config import load_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -166,16 +178,16 @@ def rename_and_backup(root_path: Path, subdir_name: str) -> list:
 # ===========================================================================
 
 _XDS_INP_TEMPLATE = """! Auto-generated XDS.INP for dataset: {name}
-! Instrument: UCSF cryo-EM (ADSC 2048x2048 CCD, microED geometry)
+! Instrument parameters below come from --config (instrument_config.yaml).
 !=============================================================================
 JOB= XYCORR INIT COLSPOT IDXREF
 !
-! Beam centre: hardcoded for this instrument.
+! Beam centre: set via --config. Measure fresh each session -- it drifts.
 ! ORGX (horizontal) and ORGY (vertical) are intentionally different values.
 ORGX= {orgx:.1f}  ORGY= {orgy:.1f}
 !
 DETECTOR_DISTANCE= {distance:.3f}
-OSCILLATION_RANGE= 1.0
+OSCILLATION_RANGE= {oscillation_range}
 STARTING_ANGLE= {starting_angle:.3f}
 X-RAY_WAVELENGTH= {wavelength:.6f}
 NAME_TEMPLATE_OF_DATA_FRAMES= {template}
@@ -197,24 +209,22 @@ MAXIMUM_ERROR_OF_SPINDLE_POSITION= 7.5
 !
 ! --- Spot finding ---
 MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT= 6
-SEPMIN= 7.0  CLUSTER_RADIUS= 3.5
+SEPMIN= {sepmin}  CLUSTER_RADIUS= {cluster_radius}
 !
 ! --- Data collection geometry ---
 OFFSET= 100
 DELPHI= 20
-GAIN= 15
+GAIN= {gain}
 !
 ! --- Trusted region and dynamic range ---
 TRUSTED_REGION= 0.0 1.2
 VALUE_RANGE_FOR_TRUSTED_DETECTOR_PIXELS= 6000. 60000.
 !
-! --- Untrusted detector regions ---
-UNTRUSTED_ELLIPSE= 966 1115 980 1120
-UNTRUSTED_QUADRILATERAL= 992 1024 1 1056 2 1113 990 1072
-!
+! --- Untrusted detector regions (from --config; omitted if none configured) ---
+{untrusted_lines}!
 ! --- Detector hardware ---
-NX= 2048  NY= 2048  QX= 0.028  QY= 0.028
-DETECTOR= ADSC  MINIMUM_VALID_PIXEL_VALUE= 1  OVERLOAD= 65000
+NX= {nx}  NY= {ny}  QX= {qx}  QY= {qy}
+DETECTOR= {detector}  MINIMUM_VALID_PIXEL_VALUE= 1  OVERLOAD= {overload}
 SENSOR_THICKNESS= 0.01
 !
 ! --- Refinement strategy for electron diffraction ---
@@ -223,7 +233,7 @@ REFINE(INTEGRATE)= POSITION BEAM ORIENTATION
 REFINE(CORRECT)=   ORIENTATION CELL AXIS BEAM
 !
 ! --- Geometry ---
-ROTATION_AXIS= 0 1 0
+ROTATION_AXIS= {rotation_axis}
 DIRECTION_OF_DETECTOR_X-AXIS= 1 0 0
 DIRECTION_OF_DETECTOR_Y-AXIS= 0 1 0
 INCIDENT_BEAM_DIRECTION= 0 0 1
@@ -236,14 +246,15 @@ FRIEDEL'S_LAW= FALSE
 def generate_xds_inp(root: Path, subdir_name: str, n_images: int,
                      orgx: float, orgy: float,
                      distance: float, wavelength: float,
+                     cfg: dict,
                      starting_angle: float = 0.0) -> None:
     """
     Write a fresh XDS.INP from the template.
 
-    Beam centre (orgx, orgy) is hardcoded for this instrument:
-      ORGX ~ 1043  (horizontal, X direction)
-      ORGY ~ 1046  (vertical,   Y direction)
-    These are intentionally different -- do not set both to 1024.
+    Beam centre (orgx, orgy), rotation axis, gain, oscillation range, and
+    untrusted detector regions all come from cfg (see instrument_config.py /
+    instrument_config.yaml) rather than being hardcoded here -- these drift
+    session to session and vary by instrument/detector.
 
     DATA_RANGE starts at 1.
     SPOT_RANGE uses the middle third of the dataset for spot finding,
@@ -253,6 +264,14 @@ def generate_xds_inp(root: Path, subdir_name: str, n_images: int,
     # than the first N frames which may have higher radiation damage
     spot_start = max(1, n_images // 3)
     spot_end   = min(n_images, 2 * n_images // 3)
+
+    untrusted_lines = ""
+    if cfg.get("untrusted_ellipse"):
+        e = cfg["untrusted_ellipse"]
+        untrusted_lines += f"UNTRUSTED_ELLIPSE= {e[0]} {e[1]} {e[2]} {e[3]}\n"
+    if cfg.get("untrusted_quadrilateral"):
+        q = cfg["untrusted_quadrilateral"]
+        untrusted_lines += "UNTRUSTED_QUADRILATERAL= " + " ".join(str(v) for v in q) + "\n"
 
     file_content = _XDS_INP_TEMPLATE.format(
         name=subdir_name,
@@ -266,19 +285,36 @@ def generate_xds_inp(root: Path, subdir_name: str, n_images: int,
         n_images=n_images,
         spot_start=spot_start,
         spot_end=spot_end,
+        oscillation_range=cfg.get("oscillation_range", 1.0),
+        sepmin=cfg.get("sepmin", 7.0),
+        cluster_radius=cfg.get("cluster_radius", 3.5),
+        gain=cfg.get("gain", 15),
+        untrusted_lines=untrusted_lines,
+        nx=cfg.get("nx", 2048),
+        ny=cfg.get("ny", 2048),
+        qx=cfg.get("qx", 0.028),
+        qy=cfg.get("qy", 0.028),
+        detector=cfg.get("detector", "ADSC"),
+        overload=cfg.get("overload", 65000),
+        rotation_axis=" ".join(str(v) for v in cfg.get("rotation_axis", [0, 1, 0])),
     )
     (root / "XDS.INP").write_text(file_content)
     log.info("  XDS.INP generated.")
 
 
 def patch_xds_inp(root: Path, subdir_name: str, n_images: int,
-                  orgx: float, orgy: float) -> None:
+                  orgx: float, orgy: float, cfg: dict) -> None:
     """
     Patch an existing XDS.INP in-place.
 
     Updates: beam centre, data/spot ranges, template name, and all
-    instrument-specific parameters. Leaves any lines we do not control
-    exactly as they are.
+    instrument-specific parameters (now sourced from cfg rather than
+    hardcoded). Leaves any lines we do not control exactly as they are.
+
+    NOTE: this function is not currently called anywhere in the main
+    pipeline -- process_one_dataset() always calls generate_xds_inp() to
+    write a fresh XDS.INP rather than patching an old one. Kept (and fixed
+    to use cfg) for any workflow that reruns against an existing XDS.INP.
     """
     xds_inp  = root / "XDS.INP"
     lines    = xds_inp.read_text(errors="replace").splitlines()
@@ -287,7 +323,7 @@ def patch_xds_inp(root: Path, subdir_name: str, n_images: int,
     spot_end   = min(n_images, 2 * n_images // 3)
 
     desired = {
-        # Beam centre -- hardcoded for this instrument, X != Y
+        # Beam centre -- from cfg, X != Y
         "ORGX=":                               f"ORGX= {orgx:.1f}  ORGY= {orgy:.1f}",
         "ORGY=":                               None,   # consumed with ORGX=
         # Data ranges
@@ -301,14 +337,17 @@ def patch_xds_inp(root: Path, subdir_name: str, n_images: int,
         "MINIMUM_FRACTION_OF_INDEXED_SPOTS=":  "MINIMUM_FRACTION_OF_INDEXED_SPOTS= 0.30",
         "MAXIMUM_ERROR_OF_SPOT_POSITION=":     "MAXIMUM_ERROR_OF_SPOT_POSITION= 15.0",
         "MAXIMUM_ERROR_OF_SPINDLE_POSITION=":  "MAXIMUM_ERROR_OF_SPINDLE_POSITION= 7.5",
-        # Spot finding
+        # Spot finding -- from cfg
         "MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT=": "MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT= 6",
-        "SEPMIN=":                             "SEPMIN= 7.0  CLUSTER_RADIUS= 3.5",
+        "SEPMIN=":                             f"SEPMIN= {cfg.get('sepmin', 7.0)}  CLUSTER_RADIUS= {cfg.get('cluster_radius', 3.5)}",
         "CLUSTER_RADIUS=":                     None,   # consumed with SEPMIN=
-        # Geometry
+        # Geometry -- from cfg
         "OFFSET=":                             "OFFSET= 100",
         "DELPHI=":                             "DELPHI= 20",
-        "GAIN=":                               "GAIN= 15",
+        "GAIN=":                               f"GAIN= {cfg.get('gain', 15)}",
+        "OSCILLATION_RANGE=":                  f"OSCILLATION_RANGE= {cfg.get('oscillation_range', 1.0)}",
+        "ROTATION_AXIS=":                      "ROTATION_AXIS= " + " ".join(
+                                                   str(v) for v in cfg.get("rotation_axis", [0, 1, 0])),
         # Trusted region
         "TRUSTED_REGION=":                     "TRUSTED_REGION= 0.0 1.2",
         "VALUE_RANGE_FOR_TRUSTED_DETECTOR_PIXELS=":
@@ -439,12 +478,15 @@ def adaptive_spot_size(root_path: Path, subdir_name: str,
     - Too small (2-3): picks up noise along with real spots
     - Too large (8+): misses weak high-resolution spots
 
-    We try [3, 4, 6] and return the value giving the best indexed fraction.
-    The best value is also patched into XDS.INP so subsequent steps use it.
+    We try [3, 4, 5, 6, 8] (widened from [3, 4, 6] -- finer granularity and
+    one more high-end candidate helps on data with more background/noise
+    around the beamstop or more variable spot size than our own test set)
+    and return the value giving the best indexed fraction. The best value
+    is also patched into XDS.INP so subsequent steps use it.
 
     Returns the best MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT value found.
     """
-    candidates = [3, 4, 6]
+    candidates = [3, 4, 5, 6, 8]
     best_val   = 6       # conservative default
     best_frac  = 0.0
 
@@ -503,7 +545,8 @@ def adaptive_spot_size(root_path: Path, subdir_name: str,
 
 
 def reindex_with_reference_cell(root_path: Path, subdir_name: str,
-                                  ref_cell: dict, log_dir: Path) -> dict:
+                                  ref_cell: dict, log_dir: Path,
+                                  space_group: int = 0) -> dict:
     """
     Re-run IDXREF with the consensus cell as a reference to correct
     datasets that indexed to a slightly wrong alternative lattice.
@@ -515,6 +558,14 @@ def reindex_with_reference_cell(root_path: Path, subdir_name: str,
 
     This is the key to getting consistent indexing across all datasets:
     every dataset ends up describing the same lattice in the same setting.
+
+    space_group: SPACE_GROUP_NUMBER to seed XDS.INP with during re-indexing.
+    Defaults to 0 (let XDS auto-determine) rather than forcing P1. Forcing
+    everything into P1 throws away a useful crystallographic quality check
+    -- a consistent space group across datasets is itself evidence the data
+    is good, and that signal disappears if every dataset is simply forced
+    into P1 regardless of what XDS would otherwise determine. Pass an
+    explicit space group only if it is already known.
 
     ref_cell: dict with keys a,b,c,alpha,beta,gamma (floats)
     Returns updated parse_idxref() result.
@@ -530,8 +581,8 @@ def reindex_with_reference_cell(root_path: Path, subdir_name: str,
     bet = ref_cell.get("beta",  90)
     gam = ref_cell.get("gamma", 90)
 
-    log.info("  Re-indexing with reference cell: %.2f %.2f %.2f  %.2f %.2f %.2f",
-             a, b, c, alp, bet, gam)
+    log.info("  Re-indexing with reference cell: %.2f %.2f %.2f  %.2f %.2f %.2f  (SG=%s)",
+             a, b, c, alp, bet, gam, space_group)
 
     # Patch UNIT_CELL_CONSTANTS and SPACE_GROUP_NUMBER into XDS.INP
     lines = xds_inp.read_text(errors="replace").splitlines()
@@ -544,7 +595,7 @@ def reindex_with_reference_cell(root_path: Path, subdir_name: str,
                        f"{alp:.3f} {bet:.3f} {gam:.3f}")
             seen_cell = True
         elif stripped.startswith("SPACE_GROUP_NUMBER="):
-            out.append("SPACE_GROUP_NUMBER= 1")
+            out.append(f"SPACE_GROUP_NUMBER= {space_group}")
             seen_sg = True
         else:
             out.append(line)
@@ -552,7 +603,7 @@ def reindex_with_reference_cell(root_path: Path, subdir_name: str,
         out.append(f"UNIT_CELL_CONSTANTS= {a:.3f} {b:.3f} {c:.3f} "
                    f"{alp:.3f} {bet:.3f} {gam:.3f}")
     if not seen_sg:
-        out.append("SPACE_GROUP_NUMBER= 1")
+        out.append(f"SPACE_GROUP_NUMBER= {space_group}")
     xds_inp.write_text("\n".join(out) + "\n")
 
     # Re-run IDXREF only (no need for COLSPOT again -- spots are already found)
@@ -874,8 +925,6 @@ def parse_correct_lp(root: Path) -> dict:
 
     return result
 
-    return result
-
 
 def find_resolution_cutoff(root: Path, isigi_threshold: float = ISIGI_CUTOFF) -> float:
     """
@@ -1082,7 +1131,7 @@ def parse_xscale_lp(run_dir: Path) -> dict:
             if v is not None and 0 <= v <= 100:
                 main_total_tokens = tokens
                 # Don't break -- take the LAST matching total line
-    
+
     if main_total_tokens:
         t = main_total_tokens
         # Column mapping confirmed from XSCALE.LP inspection:
@@ -1265,6 +1314,12 @@ def greedy_subset_search(candidates: list, trials_dir: Path,
       5. Repeat until all candidates have been evaluated.
 
     Runs O(N) XSCALE calls for N datasets -- efficient for typical batch sizes.
+
+    NOTE: this is a greedy heuristic, not a guaranteed globally-optimal
+    subset -- it can miss a better combination that isn't reachable by
+    adding datasets one at a time in ranked order. That tradeoff is
+    deliberate (exhaustive subset search is exponential), but worth
+    knowing if someone asks whether this is provably optimal.
 
     Returns (best_subset_list, best_stats_dict).
     """
@@ -1717,6 +1772,29 @@ def cluster_by_unit_cell(candidates: list,
 
 
 # ===========================================================================
+# Exclusion-reason classification (wrong cell vs. likely multi-lattice)
+# ===========================================================================
+
+def classify_exclusion_reason(indexed_fraction: float) -> str:
+    """
+    Distinguish likely multi-lattice contamination from a genuinely wrong
+    indexing solution, using indexed fraction as a rough signal.
+
+    A multi-lattice crystal typically still indexes a moderate fraction of
+    spots (XDS locks onto one of the overlapping lattices and indexes it
+    reasonably well), whereas a crystal indexed to a wholly wrong
+    alternative solution tends to show either very low or deceptively high
+    indexed fraction. This is a heuristic meant to flag datasets worth a
+    manual look -- not a definitive diagnosis. A crystal flagged as
+    "possible multi-lattice" may be worth re-examining by hand rather than
+    writing off as bad data.
+    """
+    if 0.15 < indexed_fraction < 0.55:
+        return "Possible multi-lattice"
+    return "Wrong cell"
+
+
+# ===========================================================================
 # Formatted summary table
 # ===========================================================================
 
@@ -2011,7 +2089,7 @@ def process_one_dataset(args_tuple):
     Called by the parallel executor and also directly in serial mode.
     Returns a CSV row dict, or None if the dataset should be skipped.
     """
-    root_path, cnn_model, known_cell, known_sg = args_tuple
+    root_path, cnn_model, known_cell, known_sg, cfg = args_tuple
     subdir_name = root_path.name
     t_start = time.time()
 
@@ -2037,19 +2115,26 @@ def process_one_dataset(args_tuple):
         log.error("  Cannot read header: %s -- skipping.", exc)
         return None
 
-    # Detector distance: try multiple header key names (instrument-dependent)
+    # Detector distance: try multiple header key names (instrument-dependent),
+    # then fall back to --config, then a last-resort hardcoded default.
     # UCSC: DETECTOR_DISTANCE   Johnstone lab: DISTANCE
     distance = (
         safe_float(header.get("DETECTOR_DISTANCE"), None) or
         safe_float(header.get("DISTANCE"), None) or
+        safe_float(cfg.get("detector_distance"), None) or
         787.953834
     )
 
-    wavelength  = safe_float(header.get("WAVELENGTH", 0.025082), 0.025082)
-    # Beam centre: hardcoded to instrument values, header is ignored.
-    # ORGX=1043, ORGY=1046 are the calibrated values for this microscope.
-    # These are intentionally asymmetric and must not be changed to 1024/1024.
-    orgx, orgy = 1043.0, 1046.0
+    wavelength = (
+        safe_float(header.get("WAVELENGTH"), None) or
+        safe_float(cfg.get("wavelength"), None) or
+        0.025082
+    )
+    # Beam centre: comes from --config (instrument_config.yaml), not
+    # hardcoded here. Measure fresh each session -- it drifts between
+    # sessions but is stable within one. These are intentionally
+    # asymmetric for this instrument; do not default both to the same value.
+    orgx, orgy = cfg["beam_center"][0], cfg["beam_center"][1]
 
     # Starting angle: try both key names
     starting_angle = (
@@ -2090,7 +2175,7 @@ def process_one_dataset(args_tuple):
     log_dir = root_path / "log"
     log_dir.mkdir(exist_ok=True)
     generate_xds_inp(root_path, subdir_name, n_images,
-                     orgx, orgy, distance, wavelength,
+                     orgx, orgy, distance, wavelength, cfg,
                      starting_angle=starting_angle)
 
     # If a known unit cell was provided, seed XDS.INP with it.
@@ -2107,12 +2192,15 @@ def process_one_dataset(args_tuple):
                 if s.startswith("UNIT_CELL_CONSTANTS="):
                     out.append(f"UNIT_CELL_CONSTANTS= {known_cell}")
                 elif s.startswith("SPACE_GROUP_NUMBER="):
-                    out.append(f"SPACE_GROUP_NUMBER= {known_sg or 1}")
+                    # known_sg defaults to 0 (auto-determine) -- not forced
+                    # to 1/P1. See reindex_with_reference_cell() docstring
+                    # for why forcing P1 throws away a useful quality check.
+                    out.append(f"SPACE_GROUP_NUMBER= {known_sg}")
                 else:
                     out.append(line)
             xds_inp.write_text("\n".join(out) + "\n")
             log.info("  Seeded XDS.INP with known cell: %s  SG=%s",
-                     known_cell, known_sg or 1)
+                     known_cell, known_sg)
 
     # Step 4 -- Phase 1
     if not check_images_accessible(root_path, img_files):
@@ -2120,8 +2208,8 @@ def process_one_dataset(args_tuple):
         return None
     log_idxref = log_dir / f"{subdir_name}_XDS_idxref.log"
     # Step 4a: Adaptive spot size test
-    # Try MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT = 3, 4, 6 and keep the best.
-    # This runs XYCORR INIT COLSPOT IDXREF three times but only takes ~30s
+    # Try MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT = 3, 4, 5, 6, 8 and keep the best.
+    # This runs XYCORR INIT COLSPOT IDXREF five times but only takes ~1 min
     # extra and can significantly improve the number of indexed spots.
     log.info("  Finding optimal MINIMUM_NUMBER_OF_PIXELS_IN_A_SPOT...")
     best_px = adaptive_spot_size(root_path, subdir_name, n_images, log_dir)
@@ -2272,6 +2360,14 @@ def main():
         help="Number of datasets to process in parallel (default: 1). Use 4-8 on a server.")
     parser.add_argument("--folder", type=str, default=None,
         help="Parent folder path (skips the interactive prompt).")
+    parser.add_argument("--config", type=str, default=None,
+        help=("Path to an instrument config YAML (see instrument_config.yaml "
+              "for a template). Supplies beam center, rotation axis, gain, "
+              "oscillation range, detector distance/wavelength fallbacks, and "
+              "untrusted detector regions -- all of which vary by session and "
+              "instrument, so they should not be hardcoded in this script. "
+              "Any value you omit from your config falls back to the UCSC "
+              "default. If --config is not given, UCSC defaults are used."))
     parser.add_argument("--unit-cell", type=str, default=None,
         dest="unit_cell",
         help=('Known unit cell as "a b c alpha beta gamma" (Angstroms/degrees). '
@@ -2279,10 +2375,19 @@ def main():
               'When provided, XDS is seeded with this cell and the consensus '
               'step uses it as the reference, dramatically improving indexing '
               'on difficult datasets.'))
-    parser.add_argument("--space-group", type=int, default=1,
+    parser.add_argument("--space-group", type=int, default=0,
         dest="space_group",
-        help="Known space group number (default: 1 = P1). Example: --space-group 2 for P-1.")
+        help=("Known space group number (default: 0 = let XDS auto-determine "
+              "space group). Forcing everything to P1 throws away a useful "
+              "crystallographic quality check -- a consistent space group "
+              "across datasets is itself a sign the data is good, and that "
+              "signal disappears if every dataset is forced into P1 "
+              "regardless of what XDS would otherwise determine. Only set "
+              "this if you already know the correct space group. "
+              "Example: --space-group 2 for P-1."))
     args = parser.parse_args()
+
+    cfg = load_config(args.config)
 
     if args.folder:
         parent_dir = Path(args.folder).expanduser().resolve()
@@ -2295,8 +2400,10 @@ def main():
     log.info("Parent directory : %s", parent_dir)
     log.info("Parallel workers : %d", args.workers)
     log.info("Watch mode       : %s", args.watch)
+    log.info("Instrument config: %s", args.config or "UCSC defaults (no --config given)")
     if args.unit_cell:
-        log.info("Known unit cell  : %s  (SG %d)", args.unit_cell, args.space_group)
+        sg_desc = str(args.space_group) if args.space_group else "auto (0 = XDS determines)"
+        log.info("Known unit cell  : %s  (SG %s)", args.unit_cell, sg_desc)
     else:
         log.info("Known unit cell  : not provided (pipeline will determine automatically)")
 
@@ -2318,7 +2425,16 @@ def main():
     if not xds_on_path:
         log.warning("xds_par not found -- XDS.INP files will be written but not run.")
 
-    cnn_model = load_cnn_model("microed_cnn_weights.pt")
+    # CNN weights are resolved relative to the data folder being processed
+    # (where train_cnn.py saves them), not relative to whatever directory
+    # this script happens to be invoked from. The absolute path is logged
+    # so a missing-weights warning is self-diagnosing instead of a mystery.
+    cnn_weights_path = (parent_dir / "microed_cnn_weights.pt").resolve()
+    log.info("Looking for CNN weights at: %s", cnn_weights_path)
+    cnn_model = load_cnn_model(cnn_weights_path) if cnn_weights_path.exists() else None
+    if cnn_model is None and not cnn_weights_path.exists():
+        log.warning("CNN weights not found at '%s'. Run train_cnn.py first to generate them.",
+                    cnn_weights_path)
     log.info("CNN: %s", "loaded" if cnn_model else "not loaded")
 
     csv_rows = []
@@ -2363,7 +2479,7 @@ def main():
         """
         known_cell = args.unit_cell
         known_sg   = args.space_group
-        work = [(p, cnn_model, known_cell, known_sg) for p in dataset_paths]
+        work = [(p, cnn_model, known_cell, known_sg, cfg) for p in dataset_paths]
 
         if workers <= 1:
             for item in work:
@@ -2482,7 +2598,8 @@ def main():
                 log_dir.mkdir(exist_ok=True)
                 old_frac  = float(row.get("idxref_fraction") or 0)
                 idx = reindex_with_reference_cell(root_path, row["subdirectory"],
-                                                   consensus_cell, log_dir)
+                                                   consensus_cell, log_dir,
+                                                   space_group=args.space_group)
                 new_frac = idx["indexed_fraction"] or 0.0
                 if new_frac > old_frac and (idx["indexed_spots"] or 0) > 0:
                     log.info("  %s improved: %.1f%% -> %.1f%% indexed",
@@ -2594,6 +2711,7 @@ def main():
     # ===================================================================
     # FILTER 1: Find the dominant crystal form
     # Datasets with very different unit cells are wrong indexing solutions
+    # (or, in some cases, multi-lattice crystals -- see classify_exclusion_reason)
     # and will never merge correctly with the good ones
     # ===================================================================
     log.info("\n  FILTER 1: Removing datasets with incompatible unit cells")
@@ -2661,7 +2779,8 @@ def main():
     log.info("%s", sep2)
 
     for c, reason in rejected:
-        log.info("  EXCLUDED  %-20s  Wrong cell -- %s", c["name"], reason)
+        label = classify_exclusion_reason(c.get("idxref_fraction") or 0)
+        log.info("  EXCLUDED  %-20s  %s -- %s", c["name"], label, reason)
     for c in clean:
         log.info("  KEPT      %-20s  Cell matches consensus", c["name"])
     log.info("%s", sep2)
