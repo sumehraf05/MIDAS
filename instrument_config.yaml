@@ -1,0 +1,18 @@
+# instrument_config.yaml
+# Copy this file, fill in your session's values, pass with --config path/to/this.yaml
+
+beam_center: [1043.0, 1046.0]   # ORGX, ORGY — measure fresh each session, it drifts
+rotation_axis: [0, 1, 0]
+gain: 15
+oscillation_range: 1.0          # degrees per frame — adjust for small molecule vs protein
+detector_distance: null         # null = read from image header
+wavelength: null                # null = read from image header
+detector: ADSC
+nx: 2048
+ny: 2048
+qx: 0.028
+qy: 0.028
+untrusted_ellipse: null         # e.g. [966, 1115, 980, 1120]; null = skip masking
+untrusted_quadrilateral: null
+sepmin: 7.0
+cluster_radius: 3.5
